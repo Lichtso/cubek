@@ -347,6 +347,7 @@ dependencies = [
  "cubek-interpolate",
  "cubek-matmul",
  "cubek-pool",
+ "cubek-prefix-scan",
  "cubek-random",
  "cubek-reduce",
  "cubek-std",
@@ -1408,6 +1409,17 @@ dependencies = [
  "cubecl",
  "cubecl-common",
  "cubek-pool",
+ "cubek-test-utils",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "cubek-prefix-scan"
+version = "0.3.0-pre.4"
+dependencies = [
+ "cubecl",
+ "cubecl-common",
+ "cubek-prefix-scan",
  "cubek-test-utils",
  "thiserror 2.0.20",
 ]
