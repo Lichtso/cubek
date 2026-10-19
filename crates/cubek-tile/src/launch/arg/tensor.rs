@@ -154,6 +154,8 @@ pub struct TileArgExpand<'a> {
     pub element: ElemType,
     /// The scales the values are read under: none, or a coarser operand carrying its own.
     scale: Option<Box<TileArgExpand<'static>>>,
+    /// The table that places the values' windows, and what its entry places ([`Indexing`]).
+    index: Option<(Box<TileArgExpand<'static>>, Indexing)>,
 }
 
 /// The device side of the values: a buffer, kept also as it was declared for
@@ -180,6 +182,7 @@ impl<'a> TileArgExpand<'a> {
         partitioning: &PartitioningExpand,
     ) -> TileExpand {
         let values = self.values_tile(scope, partitioning);
+        let values = self.indexing(scope, values, partitioning);
         self.scaling(scope, values, partitioning)
     }
 
@@ -193,6 +196,7 @@ impl<'a> TileArgExpand<'a> {
         let ValuesExpand::Tensor { tensor, meta, .. } = &self.values else {
             panic!("TileArg::tile_gathered: a gather reads a buffer; a tensor map lands boxes")
         };
+        assert!(self.index.is_none(), "{}", Refusal::IndexOfAStatedLayout);
         let _held = scope.define_type::<Held>(self.element);
         let tensor = scope.create_kernel_ref(TensorExpand::<Held>::__expand_from_parts(
             *meta,
@@ -221,6 +225,7 @@ impl<'a> TileArgExpand<'a> {
         let ValuesExpand::Tensor { tensor, meta, .. } = &self.values else {
             panic!("TileArg::tile_paged: a pool of pages is a buffer; a tensor map lands boxes")
         };
+        assert!(self.index.is_none(), "{}", Refusal::IndexOfAStatedLayout);
         let _held = scope.define_type::<Held>(self.element);
         let tensor = scope.create_kernel_ref(TensorExpand::<Held>::__expand_from_parts(
             *meta,
@@ -286,6 +291,37 @@ impl<'a> TileArgExpand<'a> {
         }
     }
 
+    /// `values` carrying the table that places their windows, where the operand has one: read at
+    /// the first level of `partitioning` that cuts the table's keys ([`Indexing::read_at`]), or
+    /// now, at its first entry, where none does.
+    fn indexing(
+        &self,
+        scope: &Scope,
+        values: TileExpand,
+        partitioning: &PartitioningExpand,
+    ) -> TileExpand {
+        let Some((table, indexing)) = &self.index else {
+            return values;
+        };
+        let keys = table.spec.axes().to_vec();
+        let read_at = indexing
+            .read_at(&keys, &partitioning.levels)
+            .unwrap_or_else(|refusal| panic!("{refusal}"));
+        let ValuesExpand::Tensor { tensor, meta, .. } = &table.values else {
+            panic!("{}", Refusal::IndexTableNotU32)
+        };
+        let entries = scope.create_kernel_ref(TensorExpand::<u32>::__expand_from_parts(
+            *meta,
+            tensor.expand.into(),
+        ));
+        let table = IndexTable::__expand_new(scope, entries, keys, indexing.clone());
+        let values = values.__expand_with_index_method(scope, table);
+        match read_at {
+            Some(_) => values,
+            None => values.__expand_indexed_whole_method(scope),
+        }
+    }
+
     /// `values` under these scales, a tile carrying its own scales in turn. A tensor map's values
     /// land in a stage as they lie, so the scales on them are words of block scales, which a stage
     /// keeps beside them; a scale above the words leaves the operand for the sum (`Tile::factor`)
@@ -317,6 +353,7 @@ pub struct TileArgLaunch {
     spec: TileSpec,
     element: ElemType,
     scale: Option<Box<TileArgLaunch>>,
+    index: Option<(Box<TileArgLaunch>, Indexing)>,
 }
 
 /// The host side of the values: a tensor and the width it is bound at, or a tensor map, boxed for
@@ -361,6 +398,7 @@ impl TileArgLaunch {
             spec,
             element,
             scale: None,
+            index: None,
         }
     }
 
@@ -373,6 +411,55 @@ impl TileArgLaunch {
         }));
         self
     }
+
+    /// These values with their windows placed by `table`, whose dims are its keys, as `indexing`
+    /// says ([`Indexing`]). The scales they carry move with them wherever they span the placed
+    /// axis; state them first, so they are checked here.
+    ///
+    /// # Errors
+    ///
+    /// The [`Refusal`] for a table that is not plain `u32` entries over one dim per key, or for
+    /// values, or a scale level spanning the placed axis, whose windows an entry cannot place.
+    pub fn indexed(mut self, table: TileArgLaunch, indexing: Indexing) -> Result<Self, Refusal> {
+        let ValuesLaunch::Tensor { tensor, width } = &table.values else {
+            return Err(Refusal::IndexTableNotU32);
+        };
+        let plain_u32 = table.element == u32::elem_type_native()
+            && *width == 1
+            && table.spec.packing == Packing::Plain
+            && table.scale.is_none()
+            && table.index.is_none();
+        if !plain_u32 {
+            return Err(Refusal::IndexTableNotU32);
+        }
+        let keys = table.spec.axes();
+        let rank = tensor.shape().len();
+        if rank != keys.len() {
+            return Err(Refusal::IndexTableRank {
+                keys: keys.len(),
+                rank,
+            });
+        }
+        indexing.validate(&self.spec, self.indexed_width()?, keys)?;
+        let mut level = self.scale.as_deref();
+        while let Some(scale) = level {
+            if scale.spec.axes().contains(&indexing.axis()) {
+                indexing.places(&scale.spec, scale.indexed_width()?)?;
+            }
+            level = scale.scale.as_deref();
+        }
+        self.index = Some((Box::new(table), indexing));
+        Ok(self)
+    }
+
+    /// The values a line of this buffer holds, where an entry may move its window: a tensor map
+    /// lands boxes where they lie, and is never indexed.
+    fn indexed_width(&self) -> Result<usize, Refusal> {
+        match &self.values {
+            ValuesLaunch::Tensor { width, .. } => Ok(*width),
+            ValuesLaunch::TensorMap { .. } => Err(Refusal::IndexOfAStatedLayout),
+        }
+    }
 }
 
 /// What a [`TileArg`] compiles to: its values', its spec, its element and its scales'.
@@ -382,6 +469,7 @@ pub struct TileArgCompilationArg {
     spec: TileSpec,
     element: ElemType,
     scale: Option<Box<TileArgCompilationArg>>,
+    index: Option<(Box<TileArgCompilationArg>, Indexing)>,
 }
 
 /// What the values compile to: a buffer's and the width it is bound at, or a tensor map's layout.
@@ -408,6 +496,7 @@ impl LaunchArg for TileArg<'static> {
             spec,
             element,
             scale,
+            index,
         } = arg;
         let values = match values {
             ValuesLaunch::Tensor { tensor, width } => {
@@ -433,11 +522,14 @@ impl LaunchArg for TileArg<'static> {
             }
         };
         let scale = scale.map(|level| Box::new(TileArg::register(*level, launcher)));
+        let index = index
+            .map(|(table, indexing)| (Box::new(TileArg::register(*table, launcher)), indexing));
         TileArgCompilationArg {
             values,
             spec,
             element,
             scale,
+            index,
         }
     }
 
@@ -485,11 +577,16 @@ impl LaunchArg for TileArg<'static> {
             .scale
             .as_ref()
             .map(|level| Box::new(TileArg::expand(level, builder)));
+        let index = arg
+            .index
+            .as_ref()
+            .map(|(table, indexing)| (Box::new(TileArg::expand(table, builder)), indexing.clone()));
         TileArgExpand {
             values,
             spec: arg.spec.clone(),
             element: arg.element,
             scale,
+            index,
         }
     }
 }
@@ -548,6 +645,7 @@ mod tests {
             spec: TileSpec::direct(&[Axis(0)]),
             element: ElemType::Float(FloatKind::F32),
             scale: None,
+            index: None,
         };
         TileArg::expand(&arg, builder)
     }
@@ -566,6 +664,69 @@ mod tests {
         let mut builder = KernelBuilder::new(builder_settings());
         let arg = expanded_f32_buffer(&mut builder);
         arg.__expand_lines_method::<i32, Const<1>>(&builder.scope);
+    }
+
+    /// A `[4]` `u32` table keyed by `keys`, expanded as a kernel argument outside any launch.
+    fn expanded_table(builder: &mut KernelBuilder, keys: &[Axis]) -> TileArgExpand<'static> {
+        let mut launcher = KernelLauncher::new(builder_settings());
+        let meta = TensorMeta::register(TensorMetaLaunch::new(4, keys.len()), &mut launcher);
+        let arg = TileArgCompilationArg {
+            values: ValuesCompilationArg::Tensor {
+                tensor: TensorCompilationArg {
+                    meta,
+                    buffer: BufferCompilationArg { inplace: None },
+                },
+                width: 1,
+            },
+            spec: TileSpec::direct(keys),
+            element: u32::elem_type_native(),
+            scale: None,
+            index: None,
+        };
+        TileArg::expand(&arg, builder)
+    }
+
+    /// The one-axis `f32` buffer as a run keyed by `keys`, served on a bare scope under `levels`
+    /// over `space`.
+    fn serve_indexed(keys: &[Axis], space: &[(Axis, usize)], levels: Vec<Level>) {
+        let mut builder = KernelBuilder::new(builder_settings());
+        let mut values = expanded_f32_buffer(&mut builder);
+        let table = expanded_table(&mut builder, keys);
+        values.index = Some((Box::new(table), Indexing::Run(Axis(0))));
+        let scope = &builder.scope;
+        let partitioning = PartitioningExpand {
+            space: SpaceExpand {
+                shape: Space::new(space).shape().clone(),
+                sizes: Sequence::<usize>::__expand_new(scope),
+            },
+            levels,
+        };
+        values.__expand_tile_method(scope, &partitioning);
+    }
+
+    /// The table is read at one step, the one that cuts its keys; keys cut at two levels name no
+    /// such step, and the operand is refused as it is served.
+    #[test]
+    #[should_panic(
+        expected = "the first level cutting one of [Axis(1), Axis(2)] does not cut them all"
+    )]
+    fn keys_cut_at_two_levels_are_refused_as_the_tile_expands() {
+        serve_indexed(
+            &[Axis(1), Axis(2)],
+            &[(Axis(0), 4), (Axis(1), 2), (Axis(2), 2)],
+            vec![Level::every(&[(Axis(1), 1)]), Level::every(&[(Axis(2), 1)])],
+        );
+    }
+
+    /// No level cuts the key, so it is one tile, and the run is read at the table's first entry as
+    /// the operand is served: a grouped product of a single group.
+    #[test]
+    fn a_table_no_level_cuts_is_read_as_the_tile_expands() {
+        serve_indexed(
+            &[Axis(1)],
+            &[(Axis(0), 4), (Axis(1), 1)],
+            vec![Level::every(&[(Axis(0), 2)])],
+        );
     }
 
     #[test]
