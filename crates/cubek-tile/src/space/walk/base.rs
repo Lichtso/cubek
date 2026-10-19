@@ -4,7 +4,7 @@ use cubecl::prelude::*;
 use cubecl::unexpanded;
 
 use crate::{
-    Axis, ComputeScope, Coords, Integer, IntegerExpand, Level, Region, RegionExpand, Space,
+    Axis, ComputeScope, Coords, Integer, IntegerExpand, Level, Planes, Region, RegionExpand, Space,
     StageOwner,
 };
 
@@ -292,6 +292,12 @@ impl Walk {
         let idx = self.base.plus(i);
         self.parent
             .below(self.resolve(idx), comptime!(self.level.clone()))
+    }
+
+    /// The planes below this walk's regions, each once, at its first step ([`Region::planes`]):
+    /// for a walk with no single region above it, such as a run of interleaved steps.
+    pub fn planes(&self) -> Planes {
+        self.region(0).planes()
     }
 
     /// Unravel a runtime step `idx` to its per-axis coordinates.
