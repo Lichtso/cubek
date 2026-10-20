@@ -1122,17 +1122,18 @@ impl Tile {
         unexpanded!()
     }
 
-    /// This tile without its outer scales that vary only along axes of `space`, and those scales.
-    /// With `space` the output's, they are the scales a sum over the rest of the values' axes
+    /// This tile without its outer scales that vary only along axes of `space`, and those scales,
+    /// for a sum `instruction` contracts. With `space` the output's, they are the scales the sum
     /// takes out of every term and applies once ([`scaled`](Tile::scaled)), and the tile left
     /// carries the ones each term needs.
     ///
-    /// Whoever reads the tile left: an instruction reading words of block scales, which hold no
-    /// scale above them, or a load decoding the values, which then multiplies each by the scales
-    /// it needs alone, so a load that converts codes under one level of scales (lane runs) still
-    /// takes a weight that carries a per-tensor scale above them. A tile indexing a table takes
-    /// none out: only its copy decodes it.
-    pub fn factor(&self, _space: Space) -> (Tile, Factor) {
+    /// Words of block scales always give up the scales above them: the instruction reads the
+    /// words undecoded, and holds no other scale. A decoded tile gives them up where the sum is
+    /// scaled in place ([`Instruction::scales_its_sum_in_place`]), since a load converting codes
+    /// in lane runs takes one level of scales; under any other sum they ride the load, which
+    /// multiplies by them as it decodes, rather than send the sum through shared memory.
+    /// A tile indexing a table gives up none: only its copy decodes it.
+    pub fn factor(&self, _space: Space, _instruction: Instruction) -> (Tile, Factor) {
         unexpanded!()
     }
 
@@ -1297,8 +1298,11 @@ impl TileExpand {
         &self,
         scope: &Scope,
         space: Space,
+        instruction: Instruction,
     ) -> (TileExpand, FactorExpand) {
-        if self.looks_up() {
+        let gives_up = !self.looks_up()
+            && (self.factor.staged_beside(scope) || instruction.scales_its_sum_in_place());
+        if !gives_up {
             return (self.clone(), FactorExpand::default());
         }
         let (inner, outer) = self.factor.split_on(scope, &space);
