@@ -1519,6 +1519,7 @@ dependencies = [
  "cubek-quant",
  "cubek-test-utils",
  "half",
+ "hashbrown 0.17.1",
  "serde",
 ]
 
