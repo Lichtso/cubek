@@ -15,10 +15,10 @@ use cubecl::tile::{
 };
 use cubecl::zspace::metadata::Metadata;
 use cubek_microkernel::matmul::stored::{BlockScales, Operand, Packing};
-use cubek_microkernel::matmul::tile_order::{self, VALUES_AXES};
+use cubek_microkernel::matmul::tile_order;
 use cubek_quant::quantized_arg;
 use cubek_std::Hardware;
-use cubek_std::matmul_axes::{EXPERT, K, N, blocked};
+use cubek_std::matmul_axes::{EXPERT, K, blocked};
 use cubek_std::routine::ADMITTED_PLAN_RUNS;
 
 /// The element a packed matrix's words and scales are bound in: whole `u32` words.
@@ -98,7 +98,7 @@ impl PackedTensor {
     }
 
     /// This matrix read as `slabs` matrices laid end to end along `along`, each its extent there
-    /// divided by `slabs`: a stacked weight one slab of which a table's entry picks
+    /// divided by `slabs`: a stacked input one slab of which a table's entry picks
     /// ([`MatmulIndex::Slab`](crate::kernels::MatmulIndex::Slab)).
     ///
     /// # Errors
@@ -135,8 +135,9 @@ impl PackedTensor {
     /// `operand`, of a matrix `sized` so and stored in `tile`, read what one load of `hw` takes of
     /// the tiles.
     ///
-    /// The tile order stores a `[k, n]` matrix ([`VALUES_AXES`]), so only one over `[K, N]` is
-    /// read from it.
+    /// The tile order stores a matrix over `K` and the axis it lies across
+    /// ([`values_axes`](tile_order::values_axes)), so only one over `K` then another axis is read
+    /// from it.
     ///
     /// # Errors
     ///
@@ -148,7 +149,7 @@ impl PackedTensor {
         operand: Operand,
         tile: (usize, usize),
     ) -> Result<Operand, Refusal> {
-        let [(K, k), (N, _)] = sized else {
+        let [(K, k), (across, _)] = sized else {
             return Err(STORED_TILES_UNREAD);
         };
         let block = operand.grouping(K, k).ok_or(STORED_TILES_UNREAD)?;
@@ -156,9 +157,14 @@ impl PackedTensor {
             return Err(STORED_TILES_UNREAD);
         }
         let words = hw.load_values(WORD);
-        let values = tile_order::values_storage(tile, words);
+        let values = tile_order::values_storage(across, tile, words);
         operand
-            .stored(N, words, Some((&VALUES_AXES[..], values.tiles())), None)
+            .stored(
+                across,
+                words,
+                Some((&tile_order::values_axes(across), values.tiles())),
+                None,
+            )
             .ok_or(STORED_TILES_UNREAD)
     }
 
@@ -272,6 +278,8 @@ impl PackedTensor {
             .dim(self.dim(rows_along))
             .dim(self.dim(lined))
             .build();
+        let across = self.other_axis(K);
+        let values_axes = tile_order::values_axes(across);
         // The axes the bound words carry: every digit of both axes in rows, the stored dims'
         // in tiles.
         let (words_axes, words): (Vec<Axis>, _) = match self.laid {
@@ -297,18 +305,18 @@ impl PackedTensor {
             // Stated for the read the launch takes, in the tile the matrix is stored in: the
             // same bytes at every read.
             WordsLaid::InTiles(tile) => (
-                VALUES_AXES.to_vec(),
+                values_axes.to_vec(),
                 launcher
                     .arg(
                         self.words.bound_as(tile_order::kernel_values_read(
                             self.extent(K),
-                            self.extent(N),
+                            (across, self.extent(across)),
                             tile,
                             width / self.scheme.num_quants(),
                         )),
                         WORD,
                     )
-                    .axes(&VALUES_AXES),
+                    .axes(&values_axes),
             ),
         };
         let words = words.vectorize(width);

@@ -8,8 +8,8 @@ use cubecl::tune::Work;
 use cubecl::zspace::metadata::Metadata;
 use cubek_microkernel::matmul::stored::Packing;
 use cubek_microkernel::matmul::{
-    MatmulBuffers, MatmulContraction, MatmulDestination, MatmulLayout, MatmulOperand,
-    MatmulOperands, MatmulOrder, MatmulStoredTile,
+    MatmulBuffers, MatmulDestination, MatmulLayout, MatmulOperand, MatmulOperands, MatmulOrder,
+    MatmulStoredTile,
 };
 use cubek_std::matmul_axes::{EXPERT, K, batch_axis};
 use cubek_std::routine::EstimatedProblem;
@@ -32,8 +32,6 @@ pub struct MatmulRoutineProblem {
     /// The element each operand is read at: a float operand's stored one, a packed one's the
     /// element its words unpack into ([`packings`](Self::packings) says how it is stored).
     pub elements: MatmulOperands<ElemType>,
-    /// The elements the instruction multiplies them at, where one is not its stored one.
-    pub contraction: MatmulContraction,
     /// Batches each operand holds: the output's, or fewer where an operand is broadcast.
     pub batches_held: MatmulOperands<usize>,
     /// The alignment of each operand's buffer in elements, over the axes the product names: the
@@ -190,7 +188,6 @@ impl MatmulRoutineProblem {
             stated_rows: lhs_shape[rank - 2],
             n: rhs_shape[rank - 1],
             k: lhs_shape[rank - 1],
-            contraction: MatmulContraction::AsStored,
             elements: MatmulOperands {
                 lhs: lhs.elem,
                 rhs: rhs.elem,
@@ -224,7 +221,7 @@ impl MatmulRoutineProblem {
         }
     }
 
-    /// One unbatched product of dense operands of `element` throughout, the weight laid as
+    /// One unbatched product of dense operands of `element` throughout, the rhs laid as
     /// `rhs_layout`: the problem a key of these extents describes.
     pub fn dense(
         m: usize,
@@ -246,7 +243,6 @@ impl MatmulRoutineProblem {
             stated_rows: m,
             n,
             k,
-            contraction: MatmulContraction::AsStored,
             elements: MatmulOperands {
                 lhs: element,
                 rhs: element,
@@ -286,7 +282,7 @@ impl MatmulRoutineProblem {
     }
 
     /// `rows` rows of `element` against one slab of `stack`, its slabs `[slabs, k, n]` at
-    /// `slab_strides`, the weight laid as `rhs_layout`: what one slab of a grouped or routed product
+    /// `slab_strides`, the rhs laid as `rhs_layout`: what one slab of a grouped or routed product
     /// states. The rows and the output are dense rows a launch allocates; the slab is aligned as a
     /// slab of the stack is, so a line never reads across two slabs, and read where the stack's
     /// view starts.
@@ -325,7 +321,7 @@ impl MatmulRoutineProblem {
 
     /// `m` rows by `n` columns, `k` deep, each operand of `element` or packed as `packings` says,
     /// a packed one read at [`PACKED`](Self::PACKED): one unbatched product, its rows every row
-    /// of the activation, its leading dims merged, since each of them reads the same weight. Its
+    /// of the lhs, its leading dims merged, since each of them reads the same rhs. Its
     /// operands are whole and dense, as a key describes them; the packed routines read none of
     /// a packed operand's buffer facts.
     pub fn packed(
@@ -349,7 +345,6 @@ impl MatmulRoutineProblem {
             stated_rows: m,
             n,
             k,
-            contraction: MatmulContraction::AsStored,
             elements: packings.map(|_, packing| match packing {
                 Some(_) => Self::PACKED,
                 None => element,
@@ -506,10 +501,10 @@ mod tests {
         }
     }
 
-    /// A shared weight is held once, however many batches read it; a batched one, by every batch.
-    /// Only the weight's count moves.
+    /// A shared rhs is held once, however many batches read it; a batched one, by every batch.
+    /// Only the rhs's count moves.
     #[test]
-    fn a_shared_weight_is_held_once() {
+    fn a_shared_rhs_is_held_once() {
         let shape = |batching| MatmulShape {
             m: 16,
             n: 48,
@@ -532,8 +527,8 @@ mod tests {
         );
     }
 
-    /// A col weight's buffer steps along `K`, so its alignment in the buffer's order is not the one
-    /// the product names; a row weight's buffer steps as the product names it, so the two agree.
+    /// A col rhs's buffer steps along `K`, so its alignment in the buffer's order is not the one
+    /// the product names; a row rhs's buffer steps as the product names it, so the two agree.
     #[test]
     fn the_rhs_aligns_in_the_order_it_is_bound() {
         let f16 = ElemType::Float(FloatKind::F16);
@@ -554,17 +549,17 @@ mod tests {
         );
     }
 
-    /// Where the lines lie is read off the strides, so a weight with no single
-    /// lined axis has no problem at all — it is not a col weight and not a row
-    /// weight, and there is no third tiling to sort it into.
+    /// Where the lines lie is read off the strides, so an rhs with no single
+    /// lined axis has no problem at all — it is not a col rhs and not a row
+    /// rhs, and there is no third tiling to sort it into.
     ///
-    /// Neither stride one: a weight narrowed along both dims, which no line walks.
+    /// Neither stride one: an rhs narrowed along both dims, which no line walks.
     /// Both stride one at full extents: the two dims alias, and the addressability
     /// check refuses what the contiguity read alone could not. And a stride below
     /// the row it steps over is a narrowed or aliasing view this binding cannot
     /// describe.
     #[test]
-    fn a_weight_with_no_single_lined_axis_has_no_problem() {
+    fn an_rhs_with_no_single_lined_axis_has_no_problem() {
         for strides in [[2, 8192], [1, 1], [1, 4092]] {
             assert!(
                 MatmulLayout::lines([K, N], [4096, 4096], strides).is_none(),

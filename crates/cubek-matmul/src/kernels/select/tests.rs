@@ -2,7 +2,7 @@ use super::packed::*;
 use super::problem::{MatmulProblem, OperandKind};
 use super::selector::{
     FLOAT_FEW_ROWS, MatmulChoice, MatmulDequantize, MatmulPackedChoice, MatmulSelection,
-    MatmulTable, NO_NVFP4_WEIGHT, select,
+    MatmulTable, NVFP4_TENSOR_CORES_UNSERVED, select,
 };
 use super::{MatmulKernel, MatmulKernelHeuristic, MatmulOpStrategy};
 use MatmulChoice as F;
@@ -12,6 +12,7 @@ use MatmulOpStrategy::*;
 use MatmulPackedChoice as P;
 use MatmulSelection as S;
 use cubecl::quant::scheme::{QuantScheme, QuantStore, QuantValue, ScaleDtype};
+use cubek_microkernel::matmul::{MatmulOperand, MatmulOperands};
 use cubek_std::{Hardware, devices};
 
 fn q4() -> QuantScheme {
@@ -68,7 +69,7 @@ fn ue8m0_blocks() -> QuantScheme {
         .with_store(QuantStore::PackedU32(0))
 }
 
-/// The weight read as stored by the kernel `choice` gives.
+/// The packed inputs read as stored by the kernel `choice` gives.
 fn packed(choice: P) -> S {
     S::Packed(choice)
 }
@@ -81,7 +82,7 @@ fn rule(kernel: K, otherwise: S) -> P {
     }
 }
 
-/// The weight decoded by this crate's decode, then read by the float kernel `choice` gives.
+/// The packed inputs decoded by this crate's decode, then read by the float kernel `choice` gives.
 fn decoded(choice: F) -> S {
     S::DequantizeThen {
         dequantize: MatmulDequantize::Decode,
@@ -89,6 +90,7 @@ fn decoded(choice: F) -> S {
     }
 }
 
+/// `m` rows against a `[k, n]` rhs packed under `scheme`, the lhs float.
 fn quantized(m: usize, scheme: QuantScheme) -> MatmulProblem {
     MatmulProblem {
         m,
@@ -96,16 +98,45 @@ fn quantized(m: usize, scheme: QuantScheme) -> MatmulProblem {
         n: 8192,
         batches: 1,
         streamed_rows: Some(m),
-        lhs: OperandKind::Float,
-        rhs: OperandKind::Quantized(scheme),
+        operands: MatmulOperands {
+            lhs: OperandKind::Float,
+            rhs: OperandKind::Quantized(scheme),
+            out: OperandKind::Float,
+        },
     }
 }
 
-/// A quantized activation against a packed weight takes, under every strategy, the selection a
-/// float one does: the packed routines read it as stored, every other kernel dequantized. Against a
-/// float weight it is refused.
+/// `problem` with its lhs packed under `scheme` too.
+fn with_packed_lhs(problem: MatmulProblem, scheme: QuantScheme) -> MatmulProblem {
+    MatmulProblem {
+        operands: MatmulOperands {
+            lhs: OperandKind::Quantized(scheme),
+            ..problem.operands
+        },
+        ..problem
+    }
+}
+
+/// `problem` with its rhs float.
+fn with_float_rhs(problem: MatmulProblem) -> MatmulProblem {
+    MatmulProblem {
+        operands: MatmulOperands {
+            rhs: OperandKind::Float,
+            ..problem.operands
+        },
+        ..problem
+    }
+}
+
+/// NVFP4 over an `[m, k]` lhs: its words and blocks running along `k`, its last axis.
+fn nvfp4_lhs() -> QuantScheme {
+    nvfp4_scheme()
+}
+
+/// Which input is packed never changes the selection: under every strategy, a packed lhs against
+/// a float rhs, a float lhs against a packed rhs and both packed are selected alike.
 #[test]
-fn a_quantized_activation_takes_a_float_ones_selection() {
+fn which_input_is_packed_never_changes_the_selection() {
     let hw = block_scaled();
     let strategies = [
         Autotune,
@@ -116,33 +147,52 @@ fn a_quantized_activation_takes_a_float_ones_selection() {
     ];
     for rows in [1, 512] {
         for strategy in strategies {
-            let float_lhs = quantized(rows, q4());
-            let quantized_lhs = MatmulProblem {
-                lhs: OperandKind::Quantized(nvfp4_along_k()),
-                ..float_lhs
-            };
+            let packed_rhs = quantized(rows, q4());
+            let packed_lhs = with_float_rhs(with_packed_lhs(packed_rhs, q4()));
+            let both = with_packed_lhs(packed_rhs, nvfp4_lhs());
+            let selection = select(strategy, &packed_rhs, &hw);
             assert_eq!(
-                select(strategy, &quantized_lhs, &hw),
-                select(strategy, &float_lhs, &hw),
+                select(strategy, &packed_lhs, &hw),
+                selection,
                 "{strategy:?}, {rows} rows"
             );
-            let float_rhs = MatmulProblem {
-                rhs: OperandKind::Float,
-                ..quantized_lhs
-            };
-            assert!(
-                select(strategy, &float_rhs, &hw).is_err(),
+            assert_eq!(
+                select(strategy, &both, &hw),
+                selection,
                 "{strategy:?}, {rows} rows"
             );
         }
     }
 }
 
-/// Autotune keeps an NVFP4 weight in 16-bit whatever the device: the few-rows table at the decode
-/// rows, the many-rows table past them, on a GPU with the 4-bit instruction as on one without. The
-/// NVFP4 table rounds the activation, a different product, which only its pin runs.
+/// A packed input under a scheme no kernel reads sends the product to the framework's dequantize,
+/// whichever input it is.
 #[test]
-fn autotune_keeps_an_nvfp4_activation_in_16_bit() {
+fn an_unread_scheme_on_either_input_is_dequantized_by_the_framework() {
+    let hw = block_scaled();
+    let burn = |problem: &MatmulProblem| {
+        matches!(
+            select(Autotune, problem, &hw),
+            Ok(S::DequantizeThen {
+                dequantize: MatmulDequantize::Burn,
+                ..
+            })
+        )
+    };
+    let unread_rhs = quantized(8, per_tensor());
+    assert!(burn(&unread_rhs));
+    assert!(burn(&with_float_rhs(with_packed_lhs(
+        unread_rhs,
+        per_tensor()
+    ))));
+    assert!(burn(&with_packed_lhs(quantized(8, q4()), per_tensor())));
+}
+
+/// Autotune never sends two NVFP4 inputs to the 4-bit tensor cores, whatever the device: the
+/// few-rows table at the decode rows, the many-rows table past them, on a GPU with the 4-bit
+/// instruction as on one without. Only its pin runs the NVFP4 table.
+#[test]
+fn autotune_never_names_the_4_bit_kernel() {
     for hw in [block_scaled(), devices::h100()] {
         for (rows, table) in [
             (1, MatmulTable::FewRows),
@@ -151,7 +201,11 @@ fn autotune_keeps_an_nvfp4_activation_in_16_bit() {
             (2048, MatmulTable::ManyRows),
         ] {
             assert_eq!(
-                select(Autotune, &quantized(rows, nvfp4_along_k()), &hw),
+                select(
+                    Autotune,
+                    &with_packed_lhs(quantized(rows, nvfp4_along_k()), nvfp4_lhs()),
+                    &hw
+                ),
                 Ok(packed(P::Autotune(table))),
                 "{rows} rows on {hw:?}"
             );
@@ -159,15 +213,15 @@ fn autotune_keeps_an_nvfp4_activation_in_16_bit() {
     }
 }
 
-/// Named, the 4-bit tensor-core kernel runs an NVFP4 weight whose words run down `k`, on a GPU
-/// with the 4-bit instruction, at any row count, and nothing else: it refuses another scheme, NVFP4 packed along `n`, and a GPU without the instruction. No policy names
-/// it: a policy picks by rule and never measures, and this kernel's settings are chosen by
-/// measuring.
+/// Named, the 4-bit tensor-core kernel runs two NVFP4 inputs whose words run down `k`, on a GPU
+/// with the 4-bit instruction, at any row count, and nothing else: it refuses a float input,
+/// another scheme, and a GPU without the instruction. No policy names it: a policy picks by rule
+/// and never measures, and this kernel's settings are chosen by measuring.
 #[test]
-fn the_named_nvfp4_kernel_serves_only_an_nvfp4_weight_on_a_4_bit_gpu() {
+fn the_named_nvfp4_kernel_serves_only_two_nvfp4_inputs_on_a_4_bit_gpu() {
     let named = Specific(K::Nvfp4TensorCores);
     for rows in [1, 512] {
-        let nvfp4 = quantized(rows, nvfp4_along_k());
+        let nvfp4 = with_packed_lhs(quantized(rows, nvfp4_along_k()), nvfp4_lhs());
         assert_eq!(
             select(named, &nvfp4, &block_scaled()),
             Ok(packed(P::Pin(K::Nvfp4TensorCores))),
@@ -175,9 +229,13 @@ fn the_named_nvfp4_kernel_serves_only_an_nvfp4_weight_on_a_4_bit_gpu() {
         );
         assert_eq!(
             select(named, &nvfp4, &devices::h100()),
-            Err(NO_NVFP4_WEIGHT)
+            Err(NVFP4_TENSOR_CORES_UNSERVED)
         );
-        for refused in [quantized(rows, q4()), quantized(rows, e2m1_blocks())] {
+        for refused in [
+            quantized(rows, nvfp4_along_k()),
+            with_packed_lhs(quantized(rows, q4()), nvfp4_lhs()),
+            with_packed_lhs(quantized(rows, e2m1_blocks()), nvfp4_lhs()),
+        ] {
             assert!(
                 select(named, &refused, &block_scaled()).is_err(),
                 "{refused:?}"
@@ -198,7 +256,7 @@ fn the_named_nvfp4_kernel_serves_only_an_nvfp4_weight_on_a_4_bit_gpu() {
 
 /// The heuristic decode projection takes the packed plane routine at one row, and dequantizes
 /// otherwise — onto this crate's float pair below the cubek ceiling, and onto cubek's own
-/// selector at it, reading the weight as stored rather than materializing it.
+/// selector at it, reading the packed input as stored rather than materializing it.
 #[test]
 fn heuristic_quantized_rules() {
     let hw = devices::strix_halo();
@@ -234,7 +292,7 @@ fn heuristic_quantized_rules() {
 }
 
 /// The packed plane routine binds the per-tensor scale too, as a second scale level on the
-/// weight's tile.
+/// packed input's tile.
 #[test]
 fn a_two_level_scheme_reaches_the_plane_routine() {
     let hw = devices::strix_halo();
@@ -317,14 +375,14 @@ fn an_unsupported_scheme_never_reaches_a_quantized_kernel_at_all() {
 /// The fp4 value type reaches the packed plane routine on every device, because its decode is
 /// software: `e2m1` unpacks the way the integer formats do, two codes a byte through
 /// shifts and a table, and nothing about it asks the runtime to name a type. A device
-/// that refused it would dequantize the default weight format on every step.
+/// that refused it would dequantize the default packed format on every step.
 ///
 /// Pinned on the one hardware that used to be refused, so a decode gate that comes back
 /// under another name fails here rather than routing a fleet dequantized.
 #[test]
 fn the_fp4_value_reaches_the_plane_routine_on_every_device() {
     let hw = devices::m2_pro();
-    assert!(matmul_supported(&hw, &e2m1_blocks()));
+    assert!(matmul_supported(&hw, &e2m1_blocks(), MatmulOperand::Rhs));
     assert_eq!(
         select(Specific(K::PlaneShuffle), &quantized(1, e2m1_blocks()), &hw),
         Ok(packed(P::Pin(K::PlaneShuffle)))
@@ -333,7 +391,7 @@ fn the_fp4_value_reaches_the_plane_routine_on_every_device() {
 
 /// The fp8 value types reach the packed plane routine on every device, for the reason
 /// `e2m1`'s does: a code is a byte of a word, decoded in software. MXFP8 is `e4m3` under
-/// `ue8m0` blocks, so a device that refused it would dequantize every MXFP8 weight.
+/// `ue8m0` blocks, so a device that refused it would dequantize every MXFP8 input.
 #[test]
 fn the_fp8_values_reach_the_plane_routine_on_every_device() {
     let hw = devices::m2_pro();
@@ -342,7 +400,10 @@ fn the_fp8_values_reach_the_plane_routine_on_every_device() {
             .with_value(value)
             .per_block([32], ScaleDtype::UE8M0)
             .with_store(QuantStore::PackedU32(0));
-        assert!(matmul_supported(&hw, &mxfp8), "{value:?}");
+        assert!(
+            matmul_supported(&hw, &mxfp8, MatmulOperand::Rhs),
+            "{value:?}"
+        );
         assert_eq!(
             select(Specific(K::PlaneShuffle), &quantized(1, mxfp8), &hw),
             Ok(packed(P::Pin(K::PlaneShuffle))),
@@ -353,11 +414,11 @@ fn the_fp8_values_reach_the_plane_routine_on_every_device() {
 
 /// A narrow (minifloat) scale dtype is served as it is stored: the launch binds the bytes
 /// as words and the kernel decodes one scale a read. `ue8m0` is MXFP4's scale level, so
-/// declining it would dequantize every MXFP4 weight.
+/// declining it would dequantize every MXFP4 input.
 #[test]
 fn a_narrow_scale_dtype_reaches_the_plane_routine() {
     let hw = devices::strix_halo();
-    assert!(matmul_supported(&hw, &ue8m0_blocks()));
+    assert!(matmul_supported(&hw, &ue8m0_blocks(), MatmulOperand::Rhs));
     assert_eq!(
         select(
             Specific(K::PlaneShuffle),
@@ -375,14 +436,14 @@ fn the_quantized_bound_holds_its_edges() {
     assert!(!quantized_few_rows(QUANTIZED_FEW_ROWS + 1));
 }
 
-/// A packed weight reaches its few-rows table by its own row ceiling, past the float one: the packed
+/// A packed input reaches its few-rows table by its own row ceiling, past the float one: the packed
 /// kernels stream to [`QUANTIZED_FEW_ROWS`], a float one to [`FLOAT_FEW_ROWS`].
 ///
 /// The two being different numbers is the property. Routing a float width past the float bound to
 /// the few-rows table would put it on a table whose every candidate declines it, and the widths between
 /// the bounds would be answered by the floor rather than a kernel.
 #[test]
-fn a_packed_weight_reaches_its_table_by_its_own_row_ceiling() {
+fn a_packed_input_reaches_its_table_by_its_own_row_ceiling() {
     let hw = devices::strix_halo();
     const { assert!(FLOAT_FEW_ROWS < QUANTIZED_FEW_ROWS, "the ceilings coincide") };
     assert_eq!(
@@ -416,7 +477,7 @@ fn a_policy_never_names_a_kernel_that_can_decline() {
         .into_iter()
         .filter(MatmulOpStrategy::is_policy)
     {
-        // A weight stored in tiles is the exception, and not checked here: only the packed
+        // An input stored in tiles is the exception, and not checked here: only the packed
         // routines read one, so they are what every strategy runs. A pin's kernel
         // declines on what these rules cannot see: the plane shuffle on strides, cubek's selector on
         // "no accelerated path on this device" at the launch, the packed plane routine on a
@@ -504,18 +565,19 @@ mod float {
     use MatmulKernelHeuristic as H;
     use MatmulOpStrategy::*;
     use cubecl::tile::launch::Refusal;
+    use cubek_microkernel::matmul::MatmulOperands;
     use cubek_std::devices;
 
     /// The kernel `strategy` chooses for the float `problem`: the selection, which reads a float
-    /// weight on any device alike.
+    /// input on any device alike.
     fn select(strategy: MatmulOpStrategy, problem: &MatmulProblem) -> Result<F, Refusal> {
         match super::super::selector::select(strategy, problem, &devices::cpu_12())? {
             MatmulSelection::Float(choice) => Ok(choice),
-            other => panic!("a float weight is read as it is: {other:?}"),
+            other => panic!("a float input is read as it is: {other:?}"),
         }
     }
 
-    /// A product against an unbatched weight, so the left-hand side's extents
+    /// A product against an unbatched rhs, so the left-hand side's extents
     /// merge: `m` rows in each of `batches` of them is what one memory-bound
     /// launch streams.
     fn float(m: usize, batches: usize) -> MatmulProblem {
@@ -525,14 +587,13 @@ mod float {
             n: 8192,
             batches,
             streamed_rows: Some(m * batches),
-            lhs: OperandKind::Float,
-            rhs: OperandKind::Float,
+            operands: MatmulOperands::all(OperandKind::Float),
         }
     }
 
-    /// The same shape against a weight of its own per batch — nothing merges,
-    /// and no memory-bound kernel here reads more than one weight.
-    fn batched_weight(m: usize, batches: usize) -> MatmulProblem {
+    /// The same shape against an rhs of its own per batch — nothing merges,
+    /// and no memory-bound kernel here reads more than one rhs.
+    fn batched_rhs(m: usize, batches: usize) -> MatmulProblem {
         MatmulProblem {
             streamed_rows: None,
             ..float(m, batches)
@@ -592,12 +653,12 @@ mod float {
         ] {
             assert_eq!(select(strategy, &problem), expected, "{strategy:?}");
         }
-        // The 4-bit kernel reads a packed weight: there is no float product for it to serve, at
+        // The 4-bit kernel reads a packed input: there is no float product for it to serve, at
         // any row count.
         for m in [1, 2, 512] {
             assert_eq!(
                 select(Specific(K::Nvfp4TensorCores), &float(m, 1)),
-                Err(NO_NVFP4_WEIGHT)
+                Err(NVFP4_TENSOR_CORES_UNSERVED)
             );
         }
     }
@@ -619,7 +680,7 @@ mod float {
         assert!(!float_few_rows(FLOAT_FEW_ROWS + 1));
     }
 
-    /// A row count picks the table, and nothing else does: no weight layout narrows what reaches
+    /// A row count picks the table, and nothing else does: no rhs layout narrows what reaches
     /// the few-rows table.
     #[test]
     fn the_row_count_alone_picks_the_table() {
@@ -643,7 +704,7 @@ mod float {
     /// trailing extent.
     ///
     /// `[b, m, k] @ [1, k, n]` is one product of `b·m` rows to every memory-bound
-    /// candidate — they all merge the leading extents and read the weight once.
+    /// candidate — they all merge the leading extents and read the rhs once.
     /// Routing on `m` alone calls a 512-row product an 8-row one and sends it
     /// to a table on which the float kernel rejects the plane shuffle, cubek's vec-mats
     /// reject anything past one row, and the answer is whatever is left. This
@@ -661,8 +722,8 @@ mod float {
             Ok(F::Autotune(MatmulTable::ManyRows))
         );
 
-        // A weight per batch merges nothing, at any row count.
-        for problem in [batched_weight(1, 64), batched_weight(8, 64)] {
+        // An rhs per batch merges nothing, at any row count.
+        for problem in [batched_rhs(1, 64), batched_rhs(8, 64)] {
             assert_eq!(
                 select(Autotune, &problem),
                 Ok(F::Autotune(MatmulTable::ManyRows)),

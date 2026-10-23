@@ -9,14 +9,14 @@ use cubek_microkernel::matmul::MatmulOperands;
 use cubek_microkernel::matmul::MatmulStep;
 use cubek_microkernel::matmul::stored::Operand;
 use cubek_microkernel::matmul::stored::Packing;
-use cubek_microkernel::matmul::tile_order::{self, VALUES_AXES};
+use cubek_microkernel::matmul::tile_order;
 use cubek_std::Hardware;
 use cubek_std::devices;
 use cubek_std::matmul_axes::{K, M, N, blocked};
 
 const F16: ElemType = ElemType::Float(FloatKind::F16);
 
-/// `value` packed along `axis` of a `[k, n]` weight, `block` values a scale of `scale`.
+/// `value` packed along `axis` of a `[k, n]` rhs, `block` values a scale of `scale`.
 fn scheme(value: QuantValue, axis: Axis, block: u8, scale: ScaleDtype) -> QuantScheme {
     let (block, store) = match axis {
         K => (vec![block, 1], QuantStore::PackedU32(1)),
@@ -28,7 +28,7 @@ fn scheme(value: QuantValue, axis: Axis, block: u8, scale: ScaleDtype) -> QuantS
         .with_store(store)
 }
 
-/// `m` rows against a `4096 × 2048` weight under `scheme`, read as `operand` states.
+/// `m` rows against a `4096 × 2048` rhs under `scheme`, read as `operand` states.
 fn problem(m: usize, scheme: QuantScheme, operand: Operand) -> MatmulRoutineProblem {
     let packing = Packing { operand, scheme };
     MatmulRoutineProblem::packed(
@@ -58,8 +58,8 @@ fn problems(m: usize) -> Vec<(&'static str, MatmulRoutineProblem)> {
             N,
             words,
             Some((
-                &VALUES_AXES,
-                tile_order::values_storage((128, 8), words).tiles(),
+                &tile_order::values_axes(N),
+                tile_order::values_storage(N, (128, 8), words).tiles(),
             )),
             None,
         )
@@ -96,8 +96,10 @@ fn problems(m: usize) -> Vec<(&'static str, MatmulRoutineProblem)> {
 
 /// `problem`'s step on `hw`, contracted one value at a time.
 fn step(hw: &Hardware, problem: &MatmulRoutineProblem) -> MatmulStep {
-    let packing = problem.packings.rhs.as_ref().expect("a packed problem");
-    MatmulStep::new(hw, &packing.operand, problem.elements.lhs)
+    let operands = problem
+        .packings
+        .map(|_, packing| packing.map_or(Operand::plain(), |packing| packing.operand));
+    MatmulStep::new(hw, operands, problem.elements)
 }
 
 /// Whether `space` covers a whole number of `step`s along `M`, `N` and `K`, each over the block axis
@@ -192,7 +194,7 @@ mod cube_staged {
 
     /// Every setting's cube box is whole steps under the instruction its planes run, at a
     /// prompt's rows, where its stages fit the device's shared memory: a stage is whole scale
-    /// blocks of `K`, as many as the step covers. A weight whose scales do not group `K` is
+    /// blocks of `K`, as many as the step covers. An rhs whose scales do not group `K` is
     /// declined by name, and tile order prepares.
     #[test]
     fn every_box_is_whole_steps() {
@@ -233,12 +235,12 @@ mod cube_staged {
         assert!(tile_order_prepared > 0, "no setting prepared tile order");
     }
 
-    /// A swizzled stage is read a chunk a unit, so the weight decoding into one binds a line no
+    /// A swizzled stage is read a chunk a unit, so the rhs decoding into one binds a line no
     /// wider than a chunk; a padded one takes a whole instruction step of `K` a line, so one unit
     /// decodes a whole scale block. Every packed box through each transport, on a device offering
     /// `f16` to `cmma` and to `mma`.
     #[test]
-    fn a_weight_decoding_into_a_swizzled_stage_binds_a_chunk_a_line() {
+    fn a_packed_rhs_decoding_into_a_swizzled_stage_binds_a_chunk_a_line() {
         let f16_into_f32 = |m, n, k| MmaConfig {
             a_type: F16,
             b_type: F16,
@@ -286,5 +288,88 @@ mod cube_staged {
         }
         assert!(laid.contains(&RowChunks::Swizzled), "no setting swizzled");
         assert!(laid.contains(&RowChunks::Padded), "no setting padded");
+    }
+}
+
+mod packed_lhs {
+    use super::*;
+    use crate::kernels::select::packed::nvfp4_scheme;
+    use crate::kernels::{
+        CubeShuffleMatmulRoutine, CubeStagedMatmulRoutine, DequantizedMatmulRoutine,
+        PlaneShuffleMatmulRoutine,
+    };
+    use cubecl::features::MmaConfig;
+    use cubek_std::devices;
+    use cubek_std::routine::Routine;
+
+    /// `m` rows of an `[m, k]` input packed in NVFP4 along `k`, against a float `[k, n]` one.
+    fn packed_lhs(m: usize) -> MatmulRoutineProblem {
+        let scheme = nvfp4_scheme();
+        let packing = Packing {
+            operand: Operand::of_scheme(&scheme, K, [M, K]).expect("one axis a block"),
+            scheme,
+        };
+        MatmulRoutineProblem::packed(
+            m,
+            2048,
+            4096,
+            F16,
+            MatmulOperands {
+                lhs: Some(packing),
+                ..MatmulOperands::all(None)
+            },
+        )
+    }
+
+    /// A packed `[m, k]` input against a float `[k, n]` one is declined by the routines that
+    /// stream the `[k, n]` input, and served by the routine that decodes every packed input
+    /// first: the default a product with nothing chosen falls back to.
+    #[test]
+    fn a_packed_lhs_is_decoded_where_the_streaming_routines_decline_it() {
+        let hw = devices::offering_cmma(
+            devices::m2_pro(),
+            [MmaConfig {
+                a_type: F16,
+                b_type: F16,
+                cd_type: ElemType::Float(FloatKind::F32),
+                m: 8,
+                n: 8,
+                k: 8,
+            }],
+        );
+        for m in [1, 8] {
+            let problem = packed_lhs(m);
+            for settings in PlaneShuffleMatmulRoutine
+                .settings(&hw)
+                .into_iter()
+                .chain(PlaneShuffleMatmulRoutine.packed_settings())
+            {
+                assert!(
+                    PlaneShuffleMatmulRoutine
+                        .prepare(&hw, &problem, &settings)
+                        .is_err(),
+                    "plane shuffle at {settings}, {m} rows"
+                );
+            }
+            for settings in CubeShuffleMatmulRoutine.packed_settings(&hw) {
+                assert!(
+                    CubeShuffleMatmulRoutine
+                        .prepare(&hw, &problem, &settings)
+                        .is_err(),
+                    "cube shuffle at {settings}, {m} rows"
+                );
+            }
+        }
+        let problem = packed_lhs(512);
+        let decoded = DequantizedMatmulRoutine {
+            dense: CubeStagedMatmulRoutine,
+        };
+        assert!(
+            decoded
+                .settings(&hw)
+                .iter()
+                .any(|settings| decoded.prepare(&hw, &problem, settings).is_ok()),
+            "no setting decodes the packed lhs and runs the float product"
+        );
     }
 }

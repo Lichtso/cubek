@@ -1,9 +1,10 @@
 use super::kernel::cube_staged_matmul_kernel;
 use crate::kernels::MatmulBinding;
-use crate::kernels::select::packed::nvfp4_activation_scheme;
+use crate::kernels::select::packed::nvfp4_scheme;
 use crate::kernels::{CUBE_STRIPS, cube_order_name};
 use core::num::NonZeroUsize;
 use cubecl::ir::{ElemType, FloatKind};
+use cubecl::quant::scheme::QuantScheme;
 use cubecl::tile::Space;
 use cubecl::tile::launch::Refusal;
 use cubecl::tile::space::CubeOrder;
@@ -89,22 +90,22 @@ impl CubeStagedMatmulRoutine {
     /// fills the stages.
     ///
     /// For a prompt's rows, filled by the TMA engine through the tile DSL's transport: four by
-    /// eight steps on four by two planes, the box a long weight fills the device with; two by
-    /// eight, the one a narrower weight at a prompt's chunk of rows leaves fewer cores idle with;
+    /// eight steps on four by two planes, the box a long rhs fills the device with; two by
+    /// eight, the one a narrower rhs at a prompt's chunk of rows leaves fewer cores idle with;
     /// two by four on two by two planes, the small box the narrowest projections take; each two
     /// stages in flight, its planes storing their fragments. Then four by four on two by four
     /// planes, and two by four on four by two or two by four planes, three stages in flight and the
     /// box stored by the TMA engine in one bulk copy, which a contraction of a few thousand
-    /// finishes sooner with. A stage one step deep is one tile of a weight in [tile
+    /// finishes sooner with. A stage one step deep is one tile of an input in [tile
     /// order](cubek_microkernel::matmul::tile_order), which a box lands as it lands rows. Filled by
     /// the cube's units asynchronously: four by four on two by four planes, three stages in flight,
     /// and two by four on four by two planes, two.
     ///
     /// For a decode's rows, one step of rows (the instruction's sixteen, every row a decode
-    /// holds) by one or two steps of columns, so a weight of a few thousand columns is hundreds
+    /// holds) by one or two steps of columns, so an rhs of a few thousand columns is hundreds
     /// of boxes and every core reads its share of it. Filled by the TMA engine, a stage one step
     /// deep, the most one box lands, with three or four stages in flight to keep enough of the
-    /// weight in the air. Filled by the units asynchronously, deeper stages: four steps on four
+    /// rhs in the air. Filled by the units asynchronously, deeper stages: four steps on four
     /// planes side by side, or planes sharing each step of `K`, which a projection with few
     /// columns and a long `K` keeps busy with, one step deep on four planes where `K` divides no
     /// deeper stage.
@@ -115,7 +116,7 @@ impl CubeStagedMatmulRoutine {
     /// with no block-scaled instruction has no step, and races the default alone.
     ///
     /// Every box is the one measured best for some Qwen3-4B projection on an RTX PRO 6000, the
-    /// weight read back to back from memory as a model step reads it: the prompt's at 512 and
+    /// rhs read back to back from memory as a model step reads it: the prompt's at 512 and
     /// 2048 rows, the decode's at one and eight, in rows and in tile order. A setting asking for
     /// the TMA engine whose stage one box cannot land is filled by the units instead, so each
     /// list holds only what its fill lands.
@@ -190,8 +191,8 @@ impl CubeStagedMatmulRoutine {
     }
 
     /// The step of an NVFP4 product on `hw` ([`MatmulStep`]): the least box every load of
-    /// both operands fills whole — a row of the TMA engine's box, a word of scales — under the
-    /// device's block-scaled instruction. `None` on a device that offers none. A weight in rows and
+    /// both inputs fills whole — a row of the TMA engine's box, a word of scales — under the
+    /// device's block-scaled instruction. `None` on a device that offers none. An input in rows and
     /// one in [tile order](cubek_microkernel::matmul::tile_order) step alike, and a load on such a device
     /// stores in this step.
     pub fn block_scaled_step(hw: &Hardware) -> Option<MatmulStep> {
@@ -199,47 +200,45 @@ impl CubeStagedMatmulRoutine {
         let instruction = manual_mma(hw)
             .for_triple(e2m1, e2m1, ElemType::Float(FloatKind::F32))
             .next()?;
-        let operand = Self::nvfp4_weight().operand;
+        let packings = Self::nvfp4_inputs();
+        let operands = packings.map(|_, packing| packing.map_or(Operand::plain(), |p| p.operand));
         let shape = Space::new(&[
             (M, instruction.m as usize),
             (N, instruction.n as usize),
             (K, instruction.k as usize),
         ]);
         Some(
-            MatmulStep::new(hw, &operand, e2m1)
-                .filled_by_tma(&operand, e2m1)
+            MatmulStep::new(hw, operands, MatmulOperands::all(e2m1))
+                .filled_by_tma(&operands.rhs, e2m1)
                 .under(shape),
         )
     }
 
-    /// An NVFP4 weight's packing over `[K, N]`, its words along `K`, as a checkpoint packs it and as
+    /// Both inputs packed in NVFP4, their words along `K`: the `[m, k]` one as a row-major
+    /// quantizer writes it ([`nvfp4_scheme`]), the `[k, n]` one as a checkpoint packs it and as
     /// tile order stores it.
-    fn nvfp4_weight() -> Packing {
-        let scheme = tile_order::scheme();
-        Packing {
-            operand: Operand::of_scheme(&scheme, K, [K, N]).expect("NVFP4 is one block along k"),
+    fn nvfp4_inputs() -> MatmulOperands<Option<Packing>> {
+        let packing = |input: MatmulOperand, scheme: QuantScheme| Packing {
+            operand: Operand::of_scheme(&scheme, K, input.axes())
+                .expect("NVFP4 is one block along k"),
             scheme,
+        };
+        MatmulOperands {
+            lhs: Some(packing(MatmulOperand::Lhs, nvfp4_scheme())),
+            rhs: Some(packing(MatmulOperand::Rhs, tile_order::scheme())),
+            out: None,
         }
     }
 
-    /// `m` rows of an NVFP4 activation against an NVFP4 weight `k` deep and `n` wide, into an `f16`
-    /// output: what [`block_scaled_settings`](Self::block_scaled_settings) prepares its boxes on.
+    /// `m` rows by `n` columns `k` deep of two NVFP4 inputs, into an `f16` output: what
+    /// [`block_scaled_settings`](Self::block_scaled_settings) prepares its boxes on.
     fn block_scaled_problem(m: usize, n: usize, k: usize) -> MatmulRoutineProblem {
-        let scheme = nvfp4_activation_scheme();
-        let activation = Packing {
-            operand: Operand::of_scheme(&scheme, K, [M, K]).expect("NVFP4 is one block along k"),
-            scheme,
-        };
         MatmulRoutineProblem::packed(
             m,
             n,
             k,
             ElemType::Float(FloatKind::F16),
-            MatmulOperands {
-                lhs: Some(activation),
-                rhs: Some(Self::nvfp4_weight()),
-                out: None,
-            },
+            Self::nvfp4_inputs(),
         )
     }
 
@@ -312,7 +311,7 @@ impl CubeStagedMatmulRoutine {
         registers + Self::ADDRESSING_REGISTERS <= UNIT_REGISTERS
     }
 
-    /// The settings a product against a packed weight races on `hw`
+    /// The settings a product against a packed input races on `hw`
     /// ([`CubeStagedMicrokernel::packed_settings`]), its cubes in the grid's order.
     pub fn packed_settings(&self, hw: &Hardware) -> Vec<CubeStagedMatmulRoutineSettings> {
         CubeStagedMicrokernel::packed_settings(hw)
@@ -321,7 +320,7 @@ impl CubeStagedMatmulRoutine {
             .collect()
     }
 
-    /// The settings a product of a handful of rows against a packed weight races
+    /// The settings a product of a handful of rows against a packed input races
     /// ([`CubeStagedMicrokernel::packed_one_step_settings`]), its cubes in the grid's order.
     pub fn packed_one_step_settings(&self) -> Vec<CubeStagedMatmulRoutineSettings> {
         CubeStagedMicrokernel::packed_one_step_settings()
