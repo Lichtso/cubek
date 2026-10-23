@@ -8,7 +8,9 @@ use cubek_microkernel::matmul::MatmulMicrokernel;
 use cubek_microkernel::matmul::staged_walk::MatmulCubeWrite;
 use cubek_std::Hardware;
 
-use crate::kernels::{MatmulBlueprint, MatmulOutput, MatmulRoutineProblem, MatmulTensors};
+use crate::kernels::{
+    MatmulBlueprint, MatmulIndexTable, MatmulOutput, MatmulRoutineProblem, MatmulTensors,
+};
 use cubecl::tile::{
     TileArgLaunch,
     kind::Write,
@@ -101,6 +103,34 @@ pub trait MatmulRoutine<M: MatmulMicrokernel, SM = ()>:
         settings: &Self::Settings,
     ) -> Result<(), Refusal> {
         let tensors = MatmulTensors::writing_into::<M>(client, lhs, rhs, out)?;
+        let (blueprint, grid) = self.prepare(hw, &tensors.problem(), settings)?;
+        self.dispatch_into_buffer(&tensors, blueprint, grid);
+        Ok(())
+    }
+
+    /// `lhs · rhs` on `client`'s device, every batch reading its entry of `table`, written into
+    /// `out`, `[batches.., rows, n]`, which the caller allocated as its product lies, prepared for
+    /// `hw` at `settings` ([`MatmulTensors::indexed`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`MatmulTensors::indexed`], and why `hw` cannot run the product at these settings,
+    /// [`MATMUL_INDEX_UNREAD`](crate::kernels::MATMUL_INDEX_UNREAD) for a routine whose kernel walks
+    /// no indexed input among them.
+    // The indexed operands are the dense ones beside the table and the output the caller laid out,
+    // each named where the caller hands it.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_indexed_into(
+        &self,
+        hw: &Hardware,
+        client: &Client,
+        lhs: PlainTensor,
+        rhs: StoredTensor,
+        table: MatmulIndexTable,
+        out: PlainTensor,
+        settings: &Self::Settings,
+    ) -> Result<(), Refusal> {
+        let tensors = MatmulTensors::indexed::<M>(client, lhs, rhs, table, out)?;
         let (blueprint, grid) = self.prepare(hw, &tensors.problem(), settings)?;
         self.dispatch_into_buffer(&tensors, blueprint, grid);
         Ok(())

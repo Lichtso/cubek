@@ -1,22 +1,24 @@
 use super::counters::ZeroedCounters;
-use crate::kernels::tensor::{PlainTensor, StoredTensor};
+use crate::kernels::tensor::{PACKED_STACK_UNREAD, PackedTensor, PlainTensor, StoredTensor};
 use crate::kernels::{
-    MATMUL_WHOLE_ROWS_WEIGHT_PER_BATCH, MatmulBinding, MatmulBlueprint, MatmulInputs, MatmulOutput,
-    MatmulOutputBuffer, MatmulRoutineProblem, MatmulView,
+    MATMUL_WHOLE_ROWS_WEIGHT_PER_BATCH, MatmulBinding, MatmulBlueprint, MatmulIndex,
+    MatmulIndexTable, MatmulInputs, MatmulOutput, MatmulOutputBuffer, MatmulRoutineProblem,
+    MatmulView,
 };
 use cubecl::client::Client;
-use cubecl::ir::ElemType;
+use cubecl::ir::{ElemType, UIntKind};
 use cubecl::prelude::{BufferArg, TensorMapSwizzle};
 use cubecl::std::tensor::TensorHandle;
 use cubecl::tile::launch::Refusal;
 use cubecl::tile::{
-    Axis, Geometry, Launcher, Space, StageStorage, TileArgLaunch, launch::Bound, launch::TmaBox,
-    launch::TmaOperand, launch::Unbound,
+    Axis, Geometry, Launcher, Space, StageStorage, TileArgLaunch, TileSpec, launch::Bound,
+    launch::TmaBox, launch::TmaOperand, launch::Unbound,
 };
+use cubecl::zspace::metadata::Metadata;
 use cubek_microkernel::matmul::staged_walk::MatmulStage;
 use cubek_microkernel::matmul::{
-    MatmulBlocks, MatmulMicrokernel, MatmulOperand, MatmulOperands, MatmulOrder, MatmulRowsKind,
-    MatmulWorkItem,
+    MatmulBlocks, MatmulLayout, MatmulMicrokernel, MatmulOperand, MatmulOperands, MatmulOrder,
+    MatmulRowsKind, MatmulWorkItem,
 };
 use cubek_std::MatrixLayout;
 use cubek_std::launch::tma::{tma_operand, tma_store_operand};
@@ -105,6 +107,7 @@ pub struct MatmulTensors<Out = MatmulOutputBuffer> {
     rhs: StoredTensor,
     out: Out,
     rows_kind: MatmulRowsKind,
+    table: Option<MatmulIndexTable>,
 }
 
 impl<Out: core::fmt::Debug> core::fmt::Debug for MatmulTensors<Out> {
@@ -115,6 +118,7 @@ impl<Out: core::fmt::Debug> core::fmt::Debug for MatmulTensors<Out> {
             .field("rhs", &self.rhs)
             .field("out", &self.out)
             .field("rows_kind", &self.rows_kind)
+            .field("table", &self.table)
             .finish()
     }
 }
@@ -201,7 +205,152 @@ impl MatmulTensors {
                 bound,
             },
             rows_kind: M::ROWS_KIND,
+            table: None,
         })
+    }
+
+    /// The float `lhs` against `rhs`, every batch reading its entry of `table`, as a launch on `M`
+    /// reads them, written into `out`, `[batches.., rows, n]` in the activation's element, which
+    /// the caller allocated as its product lies: a grouped one's slabs side by side, say. The
+    /// activation's batch dims broadcast against the table's. Under [`MatmulIndex::Slab`] the rhs
+    /// is the stack: a float one `[slabs, k, n]`, read where it lies; a packed one read as its
+    /// slabs ([`PackedTensor::stacked`]), every row of a batch then held whole.
+    ///
+    /// # Errors
+    ///
+    /// As [`MatmulInputs::new`] for a float rhs; for a packed one, as
+    /// [`beside_packed`](Self::beside_packed), and [`PACKED_STACK_UNREAD`] for one read along a
+    /// run of `K`, which no packed product reads. [`MATMUL_OUTPUT_UNREAD`] for an output of
+    /// another shape or element, or stored in tiles.
+    ///
+    /// # Panics
+    ///
+    /// On entries other than `u32`, a stack of other than the table's slabs, or inputs whose
+    /// contraction dims do not agree.
+    pub fn indexed<M: MatmulMicrokernel>(
+        client: &Client,
+        lhs: PlainTensor,
+        rhs: StoredTensor,
+        table: MatmulIndexTable,
+        out: PlainTensor,
+    ) -> Result<Self, Refusal> {
+        assert_eq!(
+            table.entries.elem,
+            ElemType::UInt(UIntKind::U32),
+            "a table's entries are `u32`"
+        );
+        match rhs {
+            StoredTensor::Plain(rhs) => {
+                Self::indexed_float(client, lhs, rhs, table, out, M::ROWS_KIND)
+            }
+            StoredTensor::Packed(rhs) => Self::indexed_packed(client, lhs, rhs, table, out),
+        }
+    }
+
+    /// [`indexed`](Self::indexed) against a float rhs, holding the rows as `rows_kind` says.
+    fn indexed_float(
+        client: &Client,
+        lhs: PlainTensor,
+        rhs: PlainTensor,
+        table: MatmulIndexTable,
+        out: PlainTensor,
+        rows_kind: MatmulRowsKind,
+    ) -> Result<Self, Refusal> {
+        let (lhs, rhs) = MatmulInputs::new(client, lhs, rhs)?
+            .addressable(client)
+            .into_parts();
+        let matrix = Self::matrix_of(&rhs, table.index);
+        let matrix_shape = matrix.shape();
+        let out = Self::indexed_output(&lhs, matrix_shape[0], matrix_shape[1], &table, out)?;
+        Ok(Self {
+            client: client.clone(),
+            lhs: StoredTensor::Plain(lhs),
+            rhs: StoredTensor::Plain(rhs),
+            out,
+            rows_kind,
+            table: Some(table),
+        })
+    }
+
+    /// [`indexed`](Self::indexed) against a packed stack, every row of a batch held whole.
+    fn indexed_packed(
+        client: &Client,
+        lhs: PlainTensor,
+        rhs: PackedTensor,
+        table: MatmulIndexTable,
+        out: PlainTensor,
+    ) -> Result<Self, Refusal> {
+        let MatmulIndex::Slab { slabs } = table.index else {
+            return Err(PACKED_STACK_UNREAD);
+        };
+        assert_eq!(
+            rhs.slabs(),
+            Some(slabs),
+            "a packed stack is read as the table's slabs"
+        );
+        let k = rhs.extent(K);
+        let lhs = Self::beside_packed(client, lhs, [M, K], k)?;
+        let out = Self::indexed_output(&lhs, k, rhs.extent(N), &table, out)?;
+        Ok(Self {
+            client: client.clone(),
+            lhs: StoredTensor::Plain(lhs),
+            rhs: StoredTensor::Packed(rhs),
+            out,
+            rows_kind: MatmulRowsKind::Whole,
+            table: Some(table),
+        })
+    }
+
+    /// `out`, the output of `lhs` against one `[k, n]` matrix per batch of `table`, checked to be
+    /// `[batches.., rows, n]` in the activation's element.
+    ///
+    /// # Errors
+    ///
+    /// [`MATMUL_OUTPUT_UNREAD`] for an output of another shape or element, or stored in tiles.
+    ///
+    /// # Panics
+    ///
+    /// On an activation whose contraction is not `k`.
+    fn indexed_output(
+        lhs: &PlainTensor,
+        k: usize,
+        n: usize,
+        table: &MatmulIndexTable,
+        out: PlainTensor,
+    ) -> Result<MatmulOutputBuffer, Refusal> {
+        let shape = lhs.shape();
+        let rank = shape.rank();
+        assert_eq!(shape[rank - 1], k, "the contraction dims must agree");
+        let out_shape = [table.entries.shape().as_slice(), &[shape[rank - 2], n]].concat();
+        if out.shape().as_slice() != out_shape.as_slice() || out.elem != lhs.elem || out.is_tiled()
+        {
+            return Err(MATMUL_OUTPUT_UNREAD);
+        }
+        Ok(MatmulOutputBuffer {
+            tensor: None,
+            bound: out,
+        })
+    }
+
+    /// The one `[k, n]` matrix of `rhs` a batch contracts against: a stacked rhs's first slab,
+    /// at the slab's strides, or the rhs itself.
+    ///
+    /// # Panics
+    ///
+    /// On a stack of other than `[slabs, k, n]`.
+    fn matrix_of(rhs: &PlainTensor, index: MatmulIndex) -> PlainTensor {
+        match index {
+            MatmulIndex::Slab { slabs } => {
+                let (shape, strides) = (&rhs.binding.shape, &rhs.binding.strides);
+                assert_eq!(
+                    shape.as_slice()[..1],
+                    [slabs],
+                    "a stack is `[slabs, k, n]`: {shape:?}"
+                );
+                rhs.viewed(Metadata::new(shape[1..].to_vec(), strides[1..].to_vec()))
+            }
+            MatmulIndex::RunOfK => rhs.clone(),
+        }
     }
 
     /// `tensor`, a float operand over `axes`, as a product beside a packed input reads it: dense
@@ -294,6 +443,7 @@ impl MatmulTensors {
             rhs: StoredTensor::Plain(operands.rhs),
             out: MatmulOutputBuffer { tensor, bound },
             rows_kind,
+            table: None,
         })
     }
 
@@ -320,6 +470,7 @@ impl MatmulTensors {
             rhs,
             out: MatmulOutputBuffer { tensor, bound },
             rows_kind: MatmulRowsKind::Whole,
+            table: None,
         })
     }
 
@@ -359,8 +510,8 @@ impl MatmulTensors {
             .assert_masked_where_overhanging(&out.spec);
         MatmulBinding {
             launcher,
-            lhs: lhs.arg(),
-            rhs: rhs.arg(),
+            lhs,
+            rhs,
             out,
         }
     }
@@ -373,10 +524,12 @@ impl MatmulTensors {
         grid: &Grid,
     ) -> MatmulBinding<Bound, TileArgLaunch, TileArgLaunch> {
         let launcher = self.packed_launcher(blueprint, grid);
-        let (out, out_axes) = self.out.bound.restated(&self.blocks(), M, N);
+        let batches = self.table_batches();
+        let (out, out_axes) = self.out.bound.restated(&self.blocks(), M, N, &batches);
         let out = launcher
             .arg(out.binding, out.elem)
             .axes(&out_axes)
+            .batches(&batches)
             .vectorize(blueprint.widths.out)
             .build()
             .expect(ADMITTED_PLAN_RUNS);
@@ -424,6 +577,7 @@ impl MatmulTensors<Geometry> {
             rhs: StoredTensor::Plain(operands.rhs),
             out,
             rows_kind,
+            table: None,
         })
     }
 
@@ -439,6 +593,7 @@ impl MatmulTensors<Geometry> {
             rhs,
             out,
             rows_kind: MatmulRowsKind::Whole,
+            table: None,
         })
     }
 
@@ -479,8 +634,8 @@ impl MatmulTensors<Geometry> {
             .assert_masked_where_overhanging(&out.spec);
         MatmulBinding {
             launcher,
-            lhs: lhs.arg(),
-            rhs: rhs.arg(),
+            lhs,
+            rhs,
             out,
         }
     }
@@ -594,7 +749,10 @@ impl<Out: MatmulOutput> MatmulTensors<Out> {
     /// The problem the three tensors state.
     pub fn problem(&self) -> MatmulRoutineProblem {
         match (&self.lhs, &self.rhs) {
-            (StoredTensor::Plain(lhs), StoredTensor::Plain(rhs)) => self.out.problem(lhs, rhs),
+            (StoredTensor::Plain(lhs), StoredTensor::Plain(rhs)) => match &self.table {
+                None => self.out.problem(lhs, rhs),
+                Some(table) => self.indexed_problem(lhs, rhs, table),
+            },
             (lhs, rhs) => {
                 let k = rhs.extent([K, N], K);
                 let packing = |operand: &StoredTensor| match operand {
@@ -606,7 +764,7 @@ impl<Out: MatmulOutput> MatmulTensors<Out> {
                     rhs: packing(rhs),
                     out: None,
                 };
-                MatmulRoutineProblem {
+                let problem = MatmulRoutineProblem {
                     destination: Out::DESTINATION,
                     ..MatmulRoutineProblem::packed(
                         MatmulTensors::rows_of(lhs, k),
@@ -615,8 +773,85 @@ impl<Out: MatmulOutput> MatmulTensors<Out> {
                         self.out.element(lhs),
                         packings,
                     )
+                };
+                match &self.table {
+                    None => problem,
+                    Some(table) => Self::indexed_packed_problem(problem, lhs, table),
                 }
             }
+        }
+    }
+
+    /// `problem`, a packed one over every row of `lhs`, restated over the batches of `table`, each
+    /// holding its own rows and reading its entry.
+    fn indexed_packed_problem(
+        problem: MatmulRoutineProblem,
+        lhs: &StoredTensor,
+        table: &MatmulIndexTable,
+    ) -> MatmulRoutineProblem {
+        let shape = lhs.values().shape();
+        let rank = shape.rank();
+        let batches = table.entries.shape().to_vec();
+        let held = |dims: &[usize]| dims.iter().product();
+        MatmulRoutineProblem {
+            stated_rows: shape[rank - 2],
+            batches_held: MatmulOperands {
+                lhs: held(&shape[..rank - 2]),
+                rhs: 1,
+                out: held(&batches),
+            },
+            batches,
+            index: Some(table.index),
+            ..problem
+        }
+    }
+
+    /// The product of `lhs` and `rhs`, every batch reading its entry of `table`: each input stated
+    /// at the output's rank, its missing batch dims broadcast, a stacked rhs as one slab of it and
+    /// aligned as the stack is, so a line never reads across two slabs.
+    fn indexed_problem(
+        &self,
+        lhs: &PlainTensor,
+        rhs: &PlainTensor,
+        table: &MatmulIndexTable,
+    ) -> MatmulRoutineProblem {
+        let rank = table.entries.shape().rank() + 2;
+        let matrix = MatmulTensors::matrix_of(rhs, table.index);
+        let problem = self
+            .out
+            .problem(&lhs.broadcast_to(rank), &matrix.broadcast_to(rank));
+        let (shape, strides) = (&rhs.binding.shape, &rhs.binding.strides);
+        let rhs_layout = match problem.layouts.rhs {
+            MatmulLayout::Strided => Self::stacked_layout(&matrix),
+            layout => layout,
+        };
+        MatmulRoutineProblem {
+            elem_alignments: MatmulOperands {
+                rhs: rhs.elem_alignment(),
+                ..problem.elem_alignments
+            },
+            layouts: MatmulOperands {
+                rhs: rhs_layout,
+                ..problem.layouts
+            },
+            buffer_alignments: MatmulOperands {
+                rhs: rhs_layout.buffer_alignment(shape, strides),
+                ..problem.buffer_alignments
+            },
+            index: Some(table.index),
+            ..problem
+        }
+    }
+
+    /// How `slab`, one `[k, n]` slab of a stack, lies where it is one wide along an axis: along
+    /// that axis where its stride there is the unit one. A dim of extent one addresses nothing
+    /// in a matrix of its own, but a slab's is cut from its stack, whose lines run along it.
+    fn stacked_layout(slab: &PlainTensor) -> MatmulLayout {
+        let (shape, strides) = (&slab.binding.shape, &slab.binding.strides);
+        match ([shape[0], shape[1]], [strides[0], strides[1]]) {
+            ([_, 1], [_, 1]) => MatmulLayout::Row,
+            ([1, _], [1, _]) => MatmulLayout::Col,
+            _ => MatmulLayout::Strided,
         }
     }
 
@@ -639,13 +874,15 @@ impl<Out: MatmulOutput> MatmulTensors<Out> {
         out: O,
     ) -> MatmulBinding<O, TileArgLaunch, TileArgLaunch> {
         let blocks = self.blocks();
+        let batches = self.table_batches();
         let bind = |operand: &StoredTensor, [rows, columns]: [Axis; 2], width: usize| match operand
         {
             StoredTensor::Plain(tensor) => {
-                let (tensor, axes) = tensor.restated(&blocks, rows, columns);
+                let (tensor, axes) = tensor.restated(&blocks, rows, columns, &batches);
                 launcher
                     .arg(tensor.binding, tensor.elem)
                     .axes(&axes)
+                    .batches(&batches)
                     .vectorize(width)
                     .build()
                     .expect(ADMITTED_PLAN_RUNS)
@@ -657,6 +894,8 @@ impl<Out: MatmulOutput> MatmulTensors<Out> {
         };
         let lhs = bind(&self.lhs, [M, K], blueprint.widths.lhs);
         let rhs = bind(&self.rhs, [K, N], blueprint.widths.rhs);
+        let lhs = self.read_through_table(MatmulOperand::Lhs, lhs);
+        let rhs = self.read_through_table(MatmulOperand::Rhs, rhs);
         MatmulBinding {
             launcher,
             lhs,
@@ -684,9 +923,21 @@ impl<Out: MatmulOutput> MatmulTensors<Out> {
     }
 
     /// The axes the problem's batch dims are labelled with, read off the operands' rank without
-    /// stating the whole problem ([`MatmulRoutineProblem::batch_axes`]).
+    /// stating the whole problem ([`MatmulRoutineProblem::batch_axes`]): the activation's, or a
+    /// table's dims, which are the batches.
     fn batch_axes(&self) -> Vec<Axis> {
-        MatmulRoutineProblem::batch_axes_of(self.lhs.values().shape().rank() - 2)
+        let dims = match &self.table {
+            Some(table) => table.entries.shape().rank(),
+            None => self.lhs.values().shape().rank() - 2,
+        };
+        MatmulRoutineProblem::batch_axes_of(dims)
+    }
+
+    /// The batches a table's dims are, which a packed product keeps apart; none without a table.
+    fn table_batches(&self) -> Vec<Axis> {
+        self.table.as_ref().map_or_else(Vec::new, |table| {
+            MatmulRoutineProblem::batch_axes_of(table.entries.shape().rank())
+        })
     }
 
     /// The rows a work item of the launch they were read for holds.
@@ -828,14 +1079,14 @@ impl<Out: MatmulOutput> MatmulTensors<Out> {
     }
 
     /// The launcher `blueprint`'s partitioning launches on `grid`, and the lhs and the rhs bound
-    /// under it.
+    /// under it, each reading the table where it is one of its readers.
     fn bind_operands<Mk: MatmulMicrokernel, SM>(
         &self,
         lhs: &PlainTensor,
         rhs: &PlainTensor,
         blueprint: &MatmulBlueprint<Mk, SM>,
         grid: &Grid,
-    ) -> (Launcher, [Bound; 2]) {
+    ) -> (Launcher, [TileArgLaunch; 2]) {
         let partitioning = blueprint.partitioning.as_tile();
         let launcher = grid.launcher(
             self.client(),
@@ -852,18 +1103,53 @@ impl<Out: MatmulOutput> MatmulTensors<Out> {
                 .delivery(delivery)
         };
         let orders = blueprint.microkernel.orders();
-        let rhs_source = orders.rhs.applied(source(rhs, &[K, N]));
+        // A stack is labelled, not batched: its slabs are the axis an entry picks along.
+        let stack_axes = self
+            .table
+            .as_ref()
+            .and_then(|table| table.index.axis())
+            .map(|(stacked, _)| [stacked, K, N]);
+        let rhs_source = match &stack_axes {
+            Some(axes) => launcher
+                .arg(rhs.binding.clone(), rhs.elem)
+                .axes(axes)
+                .delivery(delivery),
+            None => source(rhs, &[K, N]),
+        };
         let lhs = orders
             .lhs
             .applied(source(lhs, &[M, K]))
             .vectorize(widths.lhs)
             .build()
             .expect(ADMITTED_PLAN_RUNS);
-        let rhs = rhs_source
+        let rhs = orders
+            .rhs
+            .applied(rhs_source)
             .vectorize(widths.rhs)
             .build()
             .expect(ADMITTED_PLAN_RUNS);
+        let lhs = self.read_through_table(MatmulOperand::Lhs, lhs.arg());
+        let rhs = self.read_through_table(MatmulOperand::Rhs, rhs.arg());
         (launcher, [lhs, rhs])
+    }
+
+    /// `operand`, bound, reading its entry of the table where it is one of its readers, the
+    /// table's dims the batches; as bound otherwise.
+    fn read_through_table(&self, operand: MatmulOperand, bound: TileArgLaunch) -> TileArgLaunch {
+        match &self.table {
+            Some(table) if table.index.readers().get(operand) => {
+                let entries = TileArgLaunch::new(
+                    table.entries.binding.clone().into_tensor_arg(),
+                    table.entries.elem,
+                    1,
+                    TileSpec::direct(&self.table_batches()),
+                );
+                bound
+                    .indexed(entries, table.index.indexing())
+                    .expect(ADMITTED_PLAN_RUNS)
+            }
+            _ => bound,
+        }
     }
 
     /// `tensor`'s tensor map, a row-major matrix of `rows × columns` (each an axis and its extent),
