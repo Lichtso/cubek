@@ -553,7 +553,7 @@ impl AttentionTensors {
                 let value = read_cache(value, &[B, KV, S, DV], widths.value);
                 AttentionCacheBinding::Tiles { key, value }
             }
-            AttentionCache::Packed(cache) => AttentionCacheBinding::Packed(cache.arg()),
+            AttentionCache::Packed(cache) => AttentionCacheBinding::Packed(cache.bind(&launcher)),
         };
         let out = arg(
             &self.out_view,

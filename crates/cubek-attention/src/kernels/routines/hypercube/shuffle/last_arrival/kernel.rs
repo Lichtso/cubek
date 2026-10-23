@@ -5,7 +5,6 @@ use cubecl::tile::{Partitioning, TileArg};
 use cubecl::{self as cubecl, cube, prelude::*};
 use cubek_microkernel::attention::cube::cube_unstaged_attention_partial_microkernel;
 use cubek_microkernel::attention::hypercube::{HypercubeMergeShape, hypercube_attention_arrive};
-use cubek_microkernel::attention::packed_cache::PackedCacheArg;
 use cubek_microkernel::attention::plane::PlaneShuffleAttention;
 use cubek_microkernel::attention::{AttentionVisibility, B, PackedLines, TileLines, VisibleKeys};
 
@@ -86,7 +85,9 @@ pub fn hypercube_attention_arrival_kernel<EA: Float, E: Float, N: Size>(
 #[allow(clippy::too_many_arguments)]
 pub fn hypercube_attention_arrival_packed_kernel<EA: Float, E: Float, N: Size>(
     query: &TileArg<'_>,
-    cache: &PackedCacheArg,
+    key: &TileArg<'_>,
+    value: &TileArg<'_>,
+    key_fixup: ComptimeOption<&TileArg<'static>>,
     out: &mut Tensor<E>,
     slot_out: &mut Tensor<Vector<EA, N>>,
     slot_max: &mut Tensor<EA>,
@@ -101,8 +102,14 @@ pub fn hypercube_attention_arrival_packed_kernel<EA: Float, E: Float, N: Size>(
     #[comptime] visibility: AttentionVisibility,
     #[define(EA, E)] _elements: [ElemType; 2],
 ) {
-    let key = PackedLines::keys(cache);
-    let value = PackedLines::values(cache);
+    let key = PackedLines {
+        tile: key.tile(&partitioning),
+        fixup: key_fixup.map(|fixup| fixup.tile(&partitioning)),
+    };
+    let value = PackedLines {
+        tile: value.tile(&partitioning),
+        fixup: ComptimeOption::new_None(),
+    };
     // The cube level's walk: this cube's run of the steps, or pages, of keys.
     let run = partitioning.walk();
     let first_step = run.region(0);

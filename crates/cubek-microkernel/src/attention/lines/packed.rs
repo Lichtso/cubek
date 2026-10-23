@@ -1,66 +1,27 @@
-use crate::attention::packed_cache::packed_fields;
-use crate::attention::packed_cache::{KeyFixup, PackedCacheArg};
-use crate::attention::{B, KV, S, StepLines, StepLinesExpand, StepWalk};
-use cubecl::tile::Region;
+use crate::attention::{S, StepLines, StepLinesExpand, StepWalk};
+use cubecl::tile::{Region, Tile};
 use cubecl::{self as cubecl, cube, prelude::*};
 
-/// The keys or the values of a packed cache, read as lines ([`PackedCacheArg`]).
+/// The keys or the values of a packed cache, read as lines, decoding as they are read
+/// ([`Tile::decoded`]): each operand's codebook indices, under its norms.
 ///
-/// With a fix-up, the operand is the keys, whose lines run twice the head dim: the first half the
-/// scaled codebook entries, the second the same indices read through `sign_codebook`, scaled by
-/// the vector's entry of `errs`. A query whose second half is its projection then scores both
-/// terms in one dot.
+/// With the QJL fix-up, the keys' lines run twice the head dim: the first half the keys' tile,
+/// the second the fix-up's, the same words read through the sign codebook under each key's
+/// residual length. A query whose second half is its projection then scores both terms in one
+/// dot.
+///
+/// A step's window holds one batch and one head, so a key is a row of it, read a line at a time:
+/// the row's address and norm are computed once for all its lines. A line is read only where it
+/// lies in the head dim and its key is attended, so the decoded read skips the bounds test it
+/// would repeat.
 #[derive(CubeType, Clone)]
-#[expand(derive(Clone))]
-pub struct PackedLines<'a> {
-    pub words: &'a Tensor<u32>,
-    pub norms: &'a Tensor<f32>,
-    pub codebook: &'a Tensor<f32>,
-    /// Without a fix-up, any tensor: these are never read.
-    pub errs: &'a Tensor<f32>,
-    pub sign_codebook: &'a Tensor<f32>,
-    /// Coordinates a vector holds: the head dim.
-    #[cube(comptime)]
-    pub coords: usize,
-    #[cube(comptime)]
-    pub bits: u32,
-    #[cube(comptime)]
-    pub fixup: KeyFixup,
+pub struct PackedLines {
+    pub tile: Tile,
+    pub fixup: ComptimeOption<Tile>,
 }
 
 #[cube]
-impl<'a> PackedLines<'a> {
-    /// The keys of `cache`, their fix-up read where they carry one.
-    pub fn keys(cache: &'a PackedCacheArg) -> PackedLines<'a> {
-        PackedLines::<'a> {
-            words: &cache.key_words,
-            norms: &cache.key_norms,
-            codebook: &cache.key_codebook,
-            errs: &cache.key_errs,
-            sign_codebook: &cache.key_sign_codebook,
-            coords: comptime!(cache.coords),
-            bits: comptime!(cache.key_bits),
-            fixup: comptime!(cache.fixup),
-        }
-    }
-
-    /// The values of `cache`, which carry no fix-up.
-    pub fn values(cache: &'a PackedCacheArg) -> PackedLines<'a> {
-        PackedLines::<'a> {
-            words: &cache.value_words,
-            norms: &cache.value_norms,
-            codebook: &cache.value_codebook,
-            errs: &cache.value_norms,
-            sign_codebook: &cache.value_codebook,
-            coords: comptime!(cache.coords),
-            bits: comptime!(cache.value_bits),
-            fixup: KeyFixup::RoundOnly,
-        }
-    }
-}
-
-#[cube]
-impl<'a, N: Size> StepLines<N> for PackedLines<'a> {
+impl<N: Size> StepLines<N> for PackedLines {
     type Element = f32;
 
     fn load(
@@ -69,60 +30,57 @@ impl<'a, N: Size> StepLines<N> for PackedLines<'a> {
         walk: &StepWalk,
         #[comptime] lines: usize,
     ) -> Array<Vector<f32, N>> {
-        let width = N::value();
-        let coords = comptime!(self.coords);
-        let (batch, head, first_key) = (step.origin(B), step.origin(KV), step.origin(S));
+        let qjl = self.fixup.is_some();
+        let window = self.tile.at(step);
+        // Without a fix-up, the operand stands in for it, and is never read through it.
+        let fixup = if comptime!(qjl) {
+            self.fixup.clone().unwrap().at(step)
+        } else {
+            window.clone()
+        };
+        let (read, fixup) = (window.decoded::<f32, N>(), fixup.decoded::<f32, N>());
+        let half = comptime!(if qjl { lines / 2 } else { lines });
+        let first_key = step.origin(S);
         let (teams, keys_in_flight) = comptime!((walk.teams, walk.keys_in_flight));
         let units_per_key = comptime!(walk.units_per_key);
         let per_key = comptime!(lines.div_ceil(units_per_key));
+        // Where the units' lines tile the row exactly, every line a unit takes lies in it: only
+        // the key is tested, once, and a key's lines are read in one block, sharing its row.
+        let whole_rows = comptime!(lines.is_multiple_of(units_per_key));
         let mut loaded = Array::<Vector<f32, N>>::new(comptime!(keys_in_flight * per_key));
         #[unroll]
         for c in 0..keys_in_flight {
-            let s = first_key + c * teams + walk.team;
-            let seen = (s as u32) < walk.attended;
-            let row = batch * self.words.stride(0)
-                + head * self.words.stride(1)
-                + s * self.words.stride(2);
-            let norm_at = batch * self.norms.stride(0)
-                + head * self.norms.stride(1)
-                + s * self.norms.stride(2);
+            let at = c * teams + walk.team;
             #[unroll]
             for p in 0..per_key {
-                let line = walk.lane + p * units_per_key;
-                let mut value = Vector::<f32, N>::cast_from(0u32);
-                if line < lines && seen {
-                    let first = line * width;
-                    if first < coords {
-                        let fields = packed_fields::<f32, N>(
-                            self.words,
-                            row,
-                            first,
-                            self.codebook,
-                            comptime!(self.bits),
-                        );
-                        value = fields * Vector::cast_from(self.norms[norm_at]);
-                    } else if comptime!(self.fixup == KeyFixup::Qjl) {
-                        let fields = packed_fields::<f32, N>(
-                            self.words,
-                            row,
-                            first - coords,
-                            self.sign_codebook,
-                            comptime!(self.bits),
-                        );
-                        let err_at = batch * self.errs.stride(0)
-                            + head * self.errs.stride(1)
-                            + s * self.errs.stride(2);
-                        value = fields * Vector::cast_from(self.errs[err_at]);
+                loaded[c * per_key + p] = Vector::<f32, N>::cast_from(0u32);
+            }
+            if ((first_key + at) as u32) < walk.attended {
+                #[unroll]
+                for p in 0..per_key {
+                    let line = walk.lane + p * units_per_key;
+                    if comptime!(whole_rows) || line < lines {
+                        let value = if comptime!(qjl) {
+                            if line < half {
+                                read.read_unchecked(at, line)
+                            } else {
+                                fixup.read_unchecked(at, line - half)
+                            }
+                        } else {
+                            read.read_unchecked(at, line)
+                        };
+                        loaded[c * per_key + p] = value;
                     }
                 }
-                loaded[c * per_key + p] = value;
             }
         }
         loaded
     }
 
-    /// The same lines: a packed cache is read by each key's position, through no window.
-    fn at(&self, _region: &Region) -> PackedLines<'a> {
-        self.clone()
+    fn at(&self, region: &Region) -> PackedLines {
+        PackedLines {
+            tile: self.tile.at(region),
+            fixup: self.fixup.clone().map(|fixup| fixup.at(region)),
+        }
     }
 }
